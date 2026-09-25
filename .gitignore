@@ -1,0 +1,10 @@
+/android/.gradle/
+/android/.kotlin/
+/android/build/
+/android/app/build/
+/android/local.properties
+/android/.idea/
+/android/*.iml
+/backend/__pycache__/
+/captures/*
+!/captures/.gitkeep
