@@ -24,6 +24,18 @@ In the app, tap **Connect my glasses** if registration is needed, then **Start s
 
 The app directly uses `com.meta.wearable:mwdat-core:1.0.0` and `com.meta.wearable:mwdat-camera:1.0.0`. Developer Mode uses application ID and client token placeholders of `0`. The debug build permits local cleartext HTTP for the backend.
 
+## Voice invocation
+
+Meta's documented app invocation is **"Hey Meta, start {app name}"**. For a Developer Center app name of `ThirdEye`, say **"Hey Meta, start ThirdEye"**. The docs do not confirm `"Hey Meta, ThirdEye"` or `"Hey Meta, open ThirdEye"`. Do not configure a generic visual question as an invocation phrase. The fixed internal prompt is `Describe what I am looking at in one concise sentence.`
+
+In Wearables Developer Center, add the Android mobile app configuration with package `com.thirdeye.app` and the installed APK's signing certificate SHA-256 digest as unpadded Base64URL, set the app name used as the spoken keyword, and request **Voice Invocation** permission. Meta's current guide says to wait for approval. Developer Mode allows app registration, but its registration exemption does not establish Voice Invocation approval. Voice Invocations is experimental and available for development and beta testing, not production release channels. The project must also be registered with Meta AI and the DAT camera permission granted. Use the manual preview control once to grant camera access before hands-free use. No invocation phrase or voice microphone permission is added to the manifest. [Meta Voice Invocations guide](https://wearables.developer.meta.com/docs/develop/dat/voice-invocations/)
+
+ThirdEye opens the Wearables-level invocation stream after SDK initialization, independently of `DeviceSession`. On `LaunchApp` it acknowledges the action, starts a fresh session and camera, waits for a decoded current frame, sends one `/analyze` request, displays the answer, then stops the camera and session. A second invocation while work is active gets a failure acknowledgment. Session and camera errors also tear down resources. Manual session, preview, and analysis controls remain available for debugging. `adb logcat -s thirdeye:I` shows invocation-to-session, session-to-frame, frame-to-answer, invocation-to-answer, and cleanup timings. No real voice latency can be reported until Meta delivers a `LaunchApp` on charged glasses with the Developer Center setup complete.
+
+Tap **Describe once (debug)** from idle to run the same one-shot mode without speech. This checks session creation, frame capture, `/analyze`, and cleanup while the Developer Center voice setup is pending.
+
+**Record next session** is an optional debug toggle for manual and voice sessions. It saves a downsampled JPEG about once per second with `frames.jsonl` timestamps under `/sdcard/Android/data/com.thirdeye.app/files/replays/session-<time>/`. Each session also has a `replay.ffconcat` playlist for offline `ffplay -safe 0 -f concat -i replay.ffconcat` playback after copying the directory from the phone. The recorder is off by default.
+
 ## Vision endpoint
 
 From the project root in PowerShell, point the backend at a running llama.cpp vision server, start it, and connect the phone over USB debugging:

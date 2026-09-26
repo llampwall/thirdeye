@@ -1,9 +1,11 @@
 package com.thirdeye.app
 
 import android.Manifest
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.os.Bundle
+import android.os.SystemClock
 import android.util.Log
 import android.view.Gravity
 import android.view.Surface
@@ -31,19 +33,28 @@ import com.meta.wearable.dat.core.session.DeviceSessionState
 import com.meta.wearable.dat.core.types.Permission
 import com.meta.wearable.dat.core.types.PermissionStatus
 import com.meta.wearable.dat.core.types.RegistrationState
+import com.meta.wearable.dat.core.voiceinvocations.VoiceInvocationsStream
+import com.meta.wearable.dat.core.voiceinvocations.isVoiceInvocationsIntent
+import com.meta.wearable.dat.core.voiceinvocations.startVoiceInvocationsStream
+import com.meta.wearable.dat.core.voiceinvocations.types.actions.LaunchApp
+import java.io.File
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 
 class MainActivity : ComponentActivity() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val decoderLock = Any()
     private var renderer: HevcRenderer? = null
     private var previewSurface: Surface? = null
+    private val availableSurface = MutableStateFlow<Surface?>(null)
     private var session: DeviceSession? = null
     private var camera: Camera? = null
     private var stream: Stream? = null
@@ -56,8 +67,17 @@ class MainActivity : ComponentActivity() {
     private var streamState = StreamState.STOPPED
     private var registered = false
     private var initialized = false
+    private var destroyed = false
     private var hasFrame = false
     private var analyzing = false
+    private var voiceStream: VoiceInvocationsStream? = null
+    private var voiceInvocationJob: Job? = null
+    private var voiceErrorJob: Job? = null
+    private var voiceStateJob: Job? = null
+    private var invocationSession: InvocationSession? = null
+    private var oneShotStarting = false
+    private var recordNextSession = false
+    private var recorder: DebugRecorder? = null
     private var endpoint = "http://127.0.0.1:8765/analyze"
     private var prompt = "Describe what you see."
 
@@ -68,6 +88,8 @@ class MainActivity : ComponentActivity() {
     private lateinit var sessionButton: Button
     private lateinit var previewButton: Button
     private lateinit var analyzeButton: Button
+    private lateinit var describeButton: Button
+    private lateinit var recordButton: Button
 
     private val bluetoothPermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -93,11 +115,18 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         buildScreen()
+        if (isVoiceInvocationsIntent(intent)) message.text = "Voice launch received; waiting for Meta invocation"
         if (checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED) {
             initializeDat()
         } else {
             bluetoothPermission.launch(Manifest.permission.BLUETOOTH_CONNECT)
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        if (isVoiceInvocationsIntent(intent)) message.text = "Voice launch received; waiting for Meta invocation"
     }
 
     private fun buildScreen() {
@@ -117,6 +146,7 @@ class MainActivity : ComponentActivity() {
         surfaceView.holder.addCallback(object : SurfaceHolder.Callback {
             override fun surfaceCreated(holder: SurfaceHolder) {
                 synchronized(decoderLock) { previewSurface = holder.surface }
+                availableSurface.value = holder.surface
                 updateControls()
             }
 
@@ -128,7 +158,9 @@ class MainActivity : ComponentActivity() {
                     renderer?.close()
                     renderer = null
                 }
+                availableSurface.value = null
                 camera?.stop()
+                invocationSession?.stop()
                 updateControls()
             }
         })
@@ -150,11 +182,30 @@ class MainActivity : ComponentActivity() {
         sessionButton = Button(this).apply { setOnClickListener { if (session == null) startSession() else session?.stop() } }
         previewButton = Button(this).apply { setOnClickListener { if (camera == null) startPreview() else camera?.stop() } }
         analyzeButton = Button(this).apply { text = "Analyze current view"; setOnClickListener { showAnalyzeDialog() } }
+        describeButton = Button(this).apply {
+            text = "Describe once (debug)"
+            setOnClickListener {
+                scope.launch {
+                    try {
+                        if (!startOneShot(SystemClock.elapsedRealtimeNanos(), "debug")) showError("Describe needs idle, registered glasses and camera access")
+                    } catch (e: Exception) { showError("Describe: ${e.message}") }
+                }
+            }
+        }
+        recordButton = Button(this).apply {
+            text = "Record next session: off"
+            setOnClickListener {
+                recordNextSession = !recordNextSession
+                text = "Record next session: ${if (recordNextSession) "on" else "off"}"
+            }
+        }
         controls.addView(message)
         controls.addView(connectButton)
         controls.addView(sessionButton)
         controls.addView(previewButton)
         controls.addView(analyzeButton)
+        controls.addView(describeButton)
+        controls.addView(recordButton)
         root.addView(controls, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM))
         root.setOnApplyWindowInsetsListener { _, insets ->
             val bars = insets.getInsets(WindowInsets.Type.systemBars())
@@ -177,17 +228,101 @@ class MainActivity : ComponentActivity() {
                         updateControls()
                     }
                 }
+                startVoiceListener()
                 updateControls()
             },
             onFailure = { error, _ -> showError("DAT initialization: ${error.description}") },
         )
     }
 
+    private fun startVoiceListener() {
+        if (destroyed) return
+        voiceInvocationJob?.cancel()
+        voiceErrorJob?.cancel()
+        voiceStateJob?.cancel()
+        voiceStream?.close()
+        val listening = Wearables.startVoiceInvocationsStream(AutoDeviceSelector())
+        voiceStream = listening
+        voiceInvocationJob = scope.launch {
+            listening.invocations.collect { invocation ->
+                when (invocation) {
+                    is LaunchApp -> {
+                        val receivedNs = SystemClock.elapsedRealtimeNanos()
+                        val started = try {
+                            startOneShot(receivedNs, "invocation")
+                        } catch (e: Exception) {
+                            showError("Voice launch: ${e.message}")
+                            false
+                        }
+                        val delivered = if (started) invocation.responseHandle.sendSuccess(null)
+                            else invocation.responseHandle.sendFailure("ThirdEye is not ready")
+                        if (!delivered) Log.w("thirdeye", "Meta invocation acknowledgment was not delivered")
+                    }
+                }
+            }
+        }
+        voiceErrorJob = scope.launch { listening.errors.collect { error -> showError("Voice invocation: ${error.description}") } }
+        voiceStateJob = scope.launch { listening.state.collect { state -> Log.i("thirdeye", "Voice invocation stream: $state") } }
+    }
+
+    private suspend fun startOneShot(receivedNs: Long, origin: String): Boolean {
+        if (!registered || session != null || oneShotStarting || invocationSession?.isActive == true || analyzing) return false
+        oneShotStarting = true
+        updateControls()
+        try {
+            val surface = withTimeoutOrNull(5_000) {
+                availableSurface.first { it != null && it.isValid && surfaceView.width > 0 && surfaceView.height > 0 }
+            } ?: return false
+            val cameraAllowed = Wearables.checkPermissionStatus(Permission.CAMERA).fold(
+                onSuccess = { it == PermissionStatus.Granted },
+                onFailure = { _, _ -> false },
+            )
+            if (!cameraAllowed) return false
+            val recording = if (recordNextSession) newRecorder() else null
+            var sessionStartedNs = 0L
+            val active = InvocationSession(
+                scope, surface, recording,
+                onStarted = { startedNs ->
+                    sessionStartedNs = startedNs
+                    Log.i("thirdeye", "${origin}_to_session_ms=${(startedNs - receivedNs) / 1_000_000}")
+                },
+                onFrameReady = { frameNs ->
+                    Log.i("thirdeye", "session_to_frame_ms=${(frameNs - sessionStartedNs) / 1_000_000}")
+                },
+                onFinished = { failure, cleanupMs ->
+                    if (failure != null) showError("Describe: ${failure.message}")
+                    Log.i("thirdeye", "${origin}_cleanup_ms=$cleanupMs")
+                    invocationSession = null
+                    startVoiceListener()
+                    updateControls()
+                },
+            )
+            val mode = OneShotDescribeMode(surface, surfaceView.width, surfaceView.height, endpoint) { result, answeredNs ->
+                message.text = "${result.answer}\nFrame → answer ${result.totalMs} ms · model ${result.modelMs ?: "n/a"} ms · $origin → answer ${(answeredNs - receivedNs) / 1_000_000} ms"
+                Log.i("thirdeye", "${origin}_to_answer_ms=${(answeredNs - receivedNs) / 1_000_000} frame_to_answer_ms=${result.totalMs}")
+            }
+            invocationSession = active
+            val started = active.start(mode)
+            if (!started) invocationSession = null
+            return started
+        } finally {
+            oneShotStarting = false
+            updateControls()
+        }
+    }
+
+    private fun newRecorder(): DebugRecorder {
+        val root = getExternalFilesDir("replays") ?: File(filesDir, "replays")
+        return DebugRecorder(File(root, "session-${System.currentTimeMillis()}"), scope)
+    }
+
     private fun startSession() {
-        if (!initialized || !registered || session != null) return
+        if (!initialized || !registered || session != null || oneShotStarting || invocationSession?.isActive == true) return
         Wearables.createSession(AutoDeviceSelector()).fold(
             onSuccess = { created ->
                 session = created
+                recorder = if (recordNextSession) runCatching { newRecorder() }
+                    .onFailure { showError("Debug recorder: ${it.message}") }.getOrNull() else null
                 sessionState = DeviceSessionState.STARTING
                 sessionJob = scope.launch {
                     created.state.collect { state ->
@@ -195,8 +330,12 @@ class MainActivity : ComponentActivity() {
                         sessionState = state
                         if (state == DeviceSessionState.STOPPED) {
                             clearStream()
+                            val finishedRecorder = recorder
+                            recorder = null
+                            scope.launch { finishedRecorder?.close() }
                             session = null
                             sessionErrorJob?.cancel()
+                            startVoiceListener()
                         }
                         updateControls()
                     }
@@ -263,15 +402,18 @@ class MainActivity : ComponentActivity() {
     private fun renderFrame(frame: VideoFrame) {
         if (!frame.isCompressed) return
         try {
-            synchronized(decoderLock) {
+            val rendered = synchronized(decoderLock) {
                 val surface = previewSurface ?: return
                 if (renderer?.width != frame.width || renderer?.height != frame.height) {
                     renderer?.close()
                     renderer = HevcRenderer(frame.width, frame.height, surface)
                 }
-                renderer?.render(frame)
+                renderer?.render(frame) == true
             }
-            if (!frame.isCodecConfig && !hasFrame) {
+            if (!frame.isCodecConfig && rendered) {
+                previewSurface?.let { recorder?.record(it, frame, SystemClock.elapsedRealtimeNanos()) }
+            }
+            if (!frame.isCodecConfig && rendered && !hasFrame) {
                 hasFrame = true
                 runOnUiThread { updateControls() }
             }
@@ -343,9 +485,12 @@ class MainActivity : ComponentActivity() {
         connectButton.isEnabled = initialized
         sessionButton.text = if (session == null) "Start session" else "End session"
         sessionButton.isEnabled = registered && (session == null || sessionState == DeviceSessionState.STARTED)
+        if (oneShotStarting || invocationSession?.isActive == true) sessionButton.isEnabled = false
         previewButton.text = if (camera == null) "Start preview" else "Stop preview"
         previewButton.isEnabled = if (camera == null) sessionState == DeviceSessionState.STARTED && previewSurface != null else streamState == StreamState.STREAMING
+        if (oneShotStarting || invocationSession?.isActive == true) previewButton.isEnabled = false
         analyzeButton.isEnabled = streamState == StreamState.STREAMING && hasFrame && !analyzing
+        describeButton.isEnabled = registered && session == null && !oneShotStarting && invocationSession?.isActive != true
     }
 
     private fun showError(text: String) {
@@ -354,7 +499,13 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        destroyed = true
         clearStream()
+        invocationSession?.stop()
+        voiceInvocationJob?.cancel()
+        voiceErrorJob?.cancel()
+        voiceStateJob?.cancel()
+        voiceStream?.close()
         session?.stop()
         sessionJob?.cancel()
         sessionErrorJob?.cancel()

@@ -37,30 +37,7 @@ internal object VisionClient {
         started: Long,
     ): VisionResult {
         require(width > 0 && height > 0 && surface.isValid) { "Preview unavailable" }
-        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-        val copyStarted = SystemClock.elapsedRealtimeNanos()
-        val jpeg: ByteArray
-        val copyMs: Long
-        val jpegMs: Long
-        try {
-            suspendCoroutine<Unit> { continuation ->
-                PixelCopy.request(surface, bitmap, { result ->
-                    if (result == PixelCopy.SUCCESS) continuation.resume(Unit)
-                    else continuation.resumeWithException(IllegalStateException("PixelCopy failed: $result"))
-                }, Handler(Looper.getMainLooper()))
-            }
-            copyMs = elapsed(copyStarted)
-            val jpegStarted = SystemClock.elapsedRealtimeNanos()
-            jpeg = withContext(Dispatchers.Default) {
-                ByteArrayOutputStream().use { output ->
-                    check(bitmap.compress(Bitmap.CompressFormat.JPEG, 85, output)) { "JPEG encode failed" }
-                    output.toByteArray()
-                }
-            }
-            jpegMs = elapsed(jpegStarted)
-        } finally {
-            bitmap.recycle()
-        }
+        val (jpeg, copyMs, jpegMs) = captureJpeg(surface, width, height, 85)
         val httpStarted = SystemClock.elapsedRealtimeNanos()
         val response = withContext(Dispatchers.IO) { post(endpoint, prompt, jpeg, width, height) }
         return VisionResult(
@@ -71,6 +48,30 @@ internal object VisionClient {
             modelMs = if (response.has("model_ms") && !response.isNull("model_ms")) response.getDouble("model_ms") else null,
             totalMs = elapsed(started),
         )
+    }
+
+    suspend fun captureJpeg(surface: Surface, width: Int, height: Int, quality: Int): Triple<ByteArray, Long, Long> {
+        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        try {
+            val copyStarted = SystemClock.elapsedRealtimeNanos()
+            suspendCoroutine<Unit> { continuation ->
+                PixelCopy.request(surface, bitmap, { result ->
+                    if (result == PixelCopy.SUCCESS) continuation.resume(Unit)
+                    else continuation.resumeWithException(IllegalStateException("PixelCopy failed: $result"))
+                }, Handler(Looper.getMainLooper()))
+            }
+            val copyMs = elapsed(copyStarted)
+            val jpegStarted = SystemClock.elapsedRealtimeNanos()
+            val jpeg = withContext(Dispatchers.Default) {
+                ByteArrayOutputStream().use { output ->
+                    check(bitmap.compress(Bitmap.CompressFormat.JPEG, quality, output)) { "JPEG encode failed" }
+                    output.toByteArray()
+                }
+            }
+            return Triple(jpeg, copyMs, elapsed(jpegStarted))
+        } finally {
+            bitmap.recycle()
+        }
     }
 
     private fun post(endpoint: String, prompt: String, jpeg: ByteArray, width: Int, height: Int): JSONObject {

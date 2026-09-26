@@ -13,6 +13,7 @@ internal class HevcRenderer(val width: Int, val height: Int, surface: Surface) {
     private val parameterSets = mutableMapOf<Int, ByteArray>()
     private val outputInfo = MediaCodec.BufferInfo()
     private var hasKeyframe = false
+    private var renderedFrame = false
     private var closed = false
 
     init {
@@ -20,8 +21,9 @@ internal class HevcRenderer(val width: Int, val height: Int, surface: Surface) {
         codec.start()
     }
 
-    fun render(frame: VideoFrame) {
-        if (closed || !frame.isCompressed) return
+    fun render(frame: VideoFrame): Boolean {
+        if (closed || !frame.isCompressed) return false
+        renderedFrame = false
         val buffer = frame.buffer.duplicate()
         val bytes = ByteArray(buffer.remaining())
         buffer.get(bytes)
@@ -46,6 +48,7 @@ internal class HevcRenderer(val width: Int, val height: Int, surface: Surface) {
             }
         }
         drain()
+        return renderedFrame
     }
 
     private fun queue(data: ByteArray, ptsUs: Long, flags: Int): Boolean {
@@ -72,7 +75,10 @@ internal class HevcRenderer(val width: Int, val height: Int, surface: Surface) {
             when (val index = codec.dequeueOutputBuffer(outputInfo, 0)) {
                 MediaCodec.INFO_TRY_AGAIN_LATER -> return
                 MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> Unit
-                else -> if (index >= 0) codec.releaseOutputBuffer(index, outputInfo.size > 0)
+                else -> if (index >= 0) {
+                    if (outputInfo.size > 0) renderedFrame = true
+                    codec.releaseOutputBuffer(index, outputInfo.size > 0)
+                }
             }
         }
     }
